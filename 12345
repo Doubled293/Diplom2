@@ -1,0 +1,147 @@
+import sqlite3
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# Создание базы данных и таблиц
+def create_database():
+    """Создаёт базу данных и основные таблицы."""
+    conn = sqlite3.connect("bbus.db")
+    cursor = conn.cursor()
+
+    # Таблица клиентов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            client_id INTEGER PRIMARY KEY,
+            name TEXT,
+            email TEXT
+        )
+    """)
+
+    # Таблица транспортных средств
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vehicles (
+            vehicle_id INTEGER PRIMARY KEY,
+            name TEXT,
+            type TEXT,
+            features TEXT
+        )
+    """)
+
+    # Таблица бронирований
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            booking_id INTEGER PRIMARY KEY,
+            client_id INTEGER,
+            vehicle_id INTEGER,
+            date TEXT,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id),
+            FOREIGN KEY(vehicle_id) REFERENCES vehicles(vehicle_id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# Наполнение базы данных тестовыми данными
+def populate_data():
+    """Добавляет тестовые данные в базу."""
+    conn = sqlite3.connect("bbus.db")
+    cursor = conn.cursor()
+
+    # Добавление транспортных средств
+    vehicles = [
+        (1, "Mercedes Sprinter", "bus", "comfortable, 20 seats, air conditioning"),
+        (2, "Ford Transit", "bus", "economic, 15 seats, no air conditioning"),
+        (3, "Toyota Camry", "car", "luxury, 5 seats, automatic"),
+        (4, "Hyundai Solaris", "car", "economic, 5 seats, manual"),
+        (5, "Volkswagen Multivan", "bus", "luxury, 7 seats, air conditioning"),
+        (6, "BMW 5 Series", "car", "luxury, 5 seats, automatic, leather seats"),
+        (7, "Kia Rio", "car", "economic, 5 seats, manual, fuel-efficient"),
+        (8, "Iveco Daily", "bus", "economic, 30 seats, no air conditioning"),
+    ]
+    cursor.executemany("INSERT OR IGNORE INTO vehicles VALUES (?, ?, ?, ?)", vehicles)
+
+    # Добавление клиентов
+    clients = [
+        (1, "John Doe", "john@example.com"),
+        (2, "Jane Smith", "jane@example.com"),
+        (3, "Alice Johnson", "alice@example.com"),
+        (4, "Bob Brown", "bob@example.com"),
+        (5, "Charlie Davis", "charlie@example.com"),
+    ]
+    cursor.executemany("INSERT OR IGNORE INTO clients VALUES (?, ?, ?)", clients)
+
+    # Добавление бронирований
+    bookings = [
+        (1, 1, 1, "2024-01-15"),
+        (2, 1, 3, "2024-02-20"),
+        (3, 2, 2, "2024-03-10"),
+        (4, 3, 4, "2024-04-12"),
+        (5, 4, 5, "2024-05-05"),
+        (6, 5, 6, "2024-06-18"),
+        (7, 1, 7, "2024-07-01"),
+        (8, 3, 8, "2024-08-22"),
+        (9, 2, 6, "2024-09-15"),
+    ]
+    cursor.executemany("INSERT OR IGNORE INTO bookings VALUES (?, ?, ?, ?)", bookings)
+
+    conn.commit()
+    conn.close()
+
+
+# Рекомендация транспортных средств
+def recommend_vehicle(client_id, top_n=3):
+    """
+    Рекомендует транспортные средства для клиента на основе его предпочтений.
+    :param client_id: ID клиента
+    :param top_n: Количество рекомендаций
+    :return: DataFrame с рекомендованными транспортными средствами
+    """
+    conn = sqlite3.connect("bbus.db")
+    
+    # Извлечение данных из базы
+    bookings_df = pd.read_sql_query("SELECT * FROM bookings", conn)
+    vehicles_df = pd.read_sql_query("SELECT * FROM vehicles", conn)
+    
+    # Получение списка транспортных средств, которые уже использовал клиент
+    client_bookings = bookings_df[bookings_df["client_id"] == client_id]
+    client_vehicle_ids = client_bookings["vehicle_id"].tolist()
+    
+    # Вычисление сходства характеристик транспортных средств
+    tfidf = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = tfidf.fit_transform(vehicles_df["features"])
+    similarity_matrix = cosine_similarity(tfidf_matrix)
+
+    # Генерация списка рекомендаций
+    recommendations = []
+    for vehicle_id in client_vehicle_ids:
+        vehicle_index = vehicles_df[vehicles_df["vehicle_id"] == vehicle_id].index[0]
+        similar_indices = similarity_matrix[vehicle_index].argsort()[::-1]
+        for index in similar_indices:
+            recommended_id = vehicles_df.iloc[index]["vehicle_id"]
+            if recommended_id not in client_vehicle_ids and recommended_id not in recommendations:
+                recommendations.append(recommended_id)
+                if len(recommendations) >= top_n:
+                    break
+
+    # Формирование списка рекомендованных транспортных средств
+    recommended_vehicles = vehicles_df[vehicles_df["vehicle_id"].isin(recommendations)]
+    conn.close()
+    return recommended_vehicles
+
+
+# Главный блок выполнения
+if __name__ == "__main__":
+    # Шаг 1: Создание базы данных и таблиц
+    create_database()
+    
+    # Шаг 2: Наполнение базы данных тестовыми данными
+    populate_data()
+    
+    # Шаг 3: Рекомендация транспортных средств
+    client_id = 1  # ID клиента
+    print("Рекомендованные транспортные средства для клиента:")
+    print(recommend_vehicle(client_id))
