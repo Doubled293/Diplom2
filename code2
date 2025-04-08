@@ -1,0 +1,227 @@
+import sqlite3
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Dropout, Embedding, Flatten, Concatenate
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.utils import to_categorical
+from collections import defaultdict
+
+class VehicleRecommender:
+    def __init__(self):
+        self.conn = sqlite3.connect("bbus.db")
+        self.user_encoder = LabelEncoder()
+        self.item_encoder = LabelEncoder()
+        self.feature_scaler = StandardScaler()
+        self.model = None
+        self.user_embedding_size = 16
+        self.item_embedding_size = 16
+        self.history_size = 5  # Количество последних заказов для анализа
+        
+    def load_and_preprocess_data(self):
+        """Загрузка и предварительная обработка данных"""
+        # Загрузка данных
+        bookings = pd.read_sql_query("SELECT * FROM bookings ORDER BY date DESC", self.conn)
+        vehicles = pd.read_sql_query("SELECT * FROM vehicles", self.conn)
+        clients = pd.read_sql_query("SELECT * FROM clients", self.conn)
+        
+        # Объединение данных
+        data = pd.merge(bookings, vehicles, on='vehicle_id')
+        data = pd.merge(data, clients, on='client_id')
+        
+        # Кодирование категориальных признаков
+        data['client_id'] = self.user_encoder.fit_transform(data['client_id'])
+        data['vehicle_id'] = self.item_encoder.fit_transform(data['vehicle_id'])
+        
+        # Извлечение признаков транспортных средств
+        vehicle_features = pd.get_dummies(data[['type']])
+        vehicle_features = pd.concat([vehicle_features, 
+                                   data['features'].str.get_dummies(sep=', ')], axis=1)
+        
+        # Нормализация числовых признаков
+        numerical_features = data[['client_id', 'vehicle_id']]
+        numerical_features = self.feature_scaler.fit_transform(numerical_features)
+        
+        # Подготовка последовательностей пользователей
+        user_history = self._prepare_user_sequences(data)
+        
+        return data, vehicle_features, numerical_features, user_history
+    
+    def _prepare_user_sequences(self, data):
+        """Подготовка истории заказов пользователей"""
+        user_history = defaultdict(list)
+        for _, row in data.iterrows():
+            user_history[row['client_id']].append(row['vehicle_id'])
+        
+        # Ограничение размера истории и заполнение нулями
+        for user in user_history:
+            if len(user_history[user]) > self.history_size:
+                user_history[user] = user_history[user][:self.history_size]
+            else:
+                user_history[user] += [0] * (self.history_size - len(user_history[user]))
+        
+        return user_history
+    
+    def build_model(self, num_users, num_items, num_features):
+        """Построение нейросетевой модели"""
+        # Входные слои
+        user_input = Input(shape=(1,), name='user_input')
+        item_input = Input(shape=(1,), name='item_input')
+        history_input = Input(shape=(self.history_size,), name='history_input')
+        features_input = Input(shape=(num_features,), name='features_input')
+        
+        # Эмбеддинги
+        user_embedding = Embedding(num_users, self.user_embedding_size)(user_input)
+        user_embedding = Flatten()(user_embedding)
+        
+        item_embedding = Embedding(num_items, self.item_embedding_size)(item_input)
+        item_embedding = Flatten()(item_embedding)
+        
+        history_embedding = Embedding(num_items, self.item_embedding_size)(history_input)
+        history_embedding = Flatten()(history_embedding)
+        
+        # Объединение всех признаков
+        merged = Concatenate()([user_embedding, item_embedding, history_embedding, features_input])
+        
+        # Полносвязные слои
+        dense = Dense(64, activation='relu')(merged)
+        dense = Dropout(0.2)(dense)
+        dense = Dense(32, activation='relu')(dense)
+        dense = Dropout(0.2)(dense)
+        
+        # Выходной слой
+        output = Dense(1, activation='sigmoid')(dense)
+        
+        # Создание модели
+        self.model = Model(inputs=[user_input, item_input, history_input, features_input], 
+                          outputs=output)
+        self.model.compile(optimizer=Adam(0.001), 
+                         loss='binary_crossentropy', 
+                         metrics=['accuracy'])
+        
+    def train_model(self, X_train, y_train, X_val, y_val):
+        """Обучение модели"""
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5)
+        
+        history = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=50,
+            batch_size=64,
+            callbacks=[early_stopping]
+        )
+        return history
+    
+    def prepare_training_data(self, data, vehicle_features, user_history):
+        """Подготовка данных для обучения"""
+        # Создание положительных и отрицательных примеров
+        positive_examples = data[['client_id', 'vehicle_id']].copy()
+        positive_examples['target'] = 1
+        
+        # Создание отрицательных примеров (транспорт, который клиент не брал)
+        negative_examples = []
+        all_vehicles = data['vehicle_id'].unique()
+        
+        for client_id in data['client_id'].unique():
+            client_vehicles = set(data[data['client_id'] == client_id]['vehicle_id'])
+            negative_vehicles = list(set(all_vehicles) - client_vehicles)
+            
+            # Берем столько же отрицательных примеров, сколько положительных у клиента
+            n = len(data[data['client_id'] == client_id])
+            negative_vehicles = np.random.choice(negative_vehicles, size=n, replace=False)
+            
+            for vehicle_id in negative_vehicles:
+                negative_examples.append([client_id, vehicle_id, 0])
+        
+        negative_examples = pd.DataFrame(negative_examples, 
+                                       columns=['client_id', 'vehicle_id', 'target'])
+        
+        # Объединение данных
+        all_examples = pd.concat([positive_examples, negative_examples])
+        
+        # Подготовка признаков
+        X = {
+            'user_input': all_examples['client_id'].values,
+            'item_input': all_examples['vehicle_id'].values,
+            'history_input': np.array([user_history[u] for u in all_examples['client_id']]),
+            'features_input': vehicle_features.loc[all_examples['vehicle_id']].values
+        }
+        
+        y = all_examples['target'].values
+        
+        return train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    def recommend_for_user(self, client_id, top_n=5):
+        """Рекомендации для конкретного пользователя"""
+        if not self.model:
+            raise ValueError("Модель не обучена. Сначала вызовите train_model().")
+        
+        # Получение всех транспортных средств
+        vehicles = pd.read_sql_query("SELECT * FROM vehicles", self.conn)
+        vehicles['encoded_id'] = self.item_encoder.transform(vehicles['vehicle_id'])
+        
+        # Получение истории пользователя
+        encoded_client_id = self.user_encoder.transform([client_id])[0]
+        user_history = np.array([self.user_history.get(encoded_client_id, [0]*self.history_size)])
+        
+        # Подготовка признаков для всех транспортных средств
+        vehicle_features = pd.get_dummies(vehicles[['type']])
+        vehicle_features = pd.concat([vehicle_features, 
+                                    vehicles['features'].str.get_dummies(sep=', ')], axis=1)
+        
+        # Создание входных данных для модели
+        X = {
+            'user_input': np.full(len(vehicles), encoded_client_id),
+            'item_input': vehicles['encoded_id'].values,
+            'history_input': np.repeat(user_history, len(vehicles), axis=0),
+            'features_input': vehicle_features.values
+        }
+        
+        # Получение предсказаний
+        predictions = self.model.predict(X).flatten()
+        
+        # Выбор топ-N рекомендаций
+        top_indices = predictions.argsort()[-top_n:][::-1]
+        recommendations = vehicles.iloc[top_indices]
+        
+        return recommendations[['vehicle_id', 'name', 'type', 'features']]
+    
+    def save_model(self, path):
+        """Сохранение модели"""
+        self.model.save(path)
+    
+    def load_model(self, path):
+        """Загрузка модели"""
+        self.model = tf.keras.models.load_model(path)
+
+
+if __name__ == "__main__":
+    # Инициализация системы
+    recommender = VehicleRecommender()
+    
+    # Загрузка и подготовка данных
+    data, vehicle_features, numerical_features, user_history = recommender.load_and_preprocess_data()
+    recommender.user_history = user_history
+    
+    # Построение модели
+    num_users = len(data['client_id'].unique())
+    num_items = len(data['vehicle_id'].unique())
+    num_features = vehicle_features.shape[1]
+    
+    recommender.build_model(num_users, num_items, num_features)
+    
+    # Подготовка данных для обучения
+    X_train, X_val, y_train, y_val = recommender.prepare_training_data(data, vehicle_features, user_history)
+    
+    # Обучение модели
+    history = recommender.train_model(X_train, y_train, X_val, y_val)
+    
+    # Пример рекомендаций
+    print("\nРекомендации для клиента с ID=1:")
+    print(recommender.recommend_for_user(1))
+    
+    # Сохранение модели
+    recommender.save_model("vehicle_recommender.h5")
