@@ -22,7 +22,7 @@ class VehicleRecommender:
         self.history_size = 5  # Количество последних заказов для анализа
         
     def load_and_preprocess_data(self):
-        """Загрузка и предварительная обработка данных"""
+        "Загрузка и предварительная обработка данных"
         # Загрузка данных
         bookings = pd.read_sql_query("SELECT * FROM bookings ORDER BY date DESC", self.conn)
         vehicles = pd.read_sql_query("SELECT * FROM vehicles", self.conn)
@@ -51,7 +51,7 @@ class VehicleRecommender:
         return data, vehicle_features, numerical_features, user_history
     
     def _prepare_user_sequences(self, data):
-        """Подготовка истории заказов пользователей"""
+        # Подготовка истории заказов пользователей
         user_history = defaultdict(list)
         for _, row in data.iterrows():
             user_history[row['client_id']].append(row['vehicle_id'])
@@ -66,7 +66,7 @@ class VehicleRecommender:
         return user_history
     
     def build_model(self, num_users, num_items, num_features):
-        """Построение нейросетевой модели"""
+        # Построение нейросетевой модели
         # Входные слои
         user_input = Input(shape=(1,), name='user_input')
         item_input = Input(shape=(1,), name='item_input')
@@ -103,7 +103,7 @@ class VehicleRecommender:
                          metrics=['accuracy'])
         
     def train_model(self, X_train, y_train, X_val, y_val):
-        """Обучение модели"""
+        # Обучение модели
         early_stopping = EarlyStopping(monitor='val_loss', patience=5)
         
         history = self.model.fit(
@@ -116,7 +116,7 @@ class VehicleRecommender:
         return history
     
     def prepare_training_data(self, data, vehicle_features, user_history):
-        """Подготовка данных для обучения"""
+        # Подготовка данных для обучения
         # Создание положительных и отрицательных примеров
         positive_examples = data[['client_id', 'vehicle_id']].copy()
         positive_examples['target'] = 1
@@ -155,9 +155,9 @@ class VehicleRecommender:
         return train_test_split(X, y, test_size=0.2, random_state=42)
     
     def recommend_for_user(self, client_id, top_n=5):
-        """Рекомендации для конкретного пользователя"""
+        # Рекомендации для конкретного пользователя
         if not self.model:
-            raise ValueError("Модель не обучена. Сначала вызовите train_model().")
+            raise ValueError("Модель не обучена")
         
         # Получение всех транспортных средств
         vehicles = pd.read_sql_query("SELECT * FROM vehicles", self.conn)
@@ -190,11 +190,11 @@ class VehicleRecommender:
         return recommendations[['vehicle_id', 'name', 'type', 'features']]
     
     def save_model(self, path):
-        """Сохранение модели"""
+        # Сохранение модели
         self.model.save(path)
     
     def load_model(self, path):
-        """Загрузка модели"""
+        # Загрузка модели
         self.model = tf.keras.models.load_model(path)
 
 
