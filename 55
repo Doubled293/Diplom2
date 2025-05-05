@@ -1,0 +1,256 @@
+# vehicle_recommender_system.py
+
+import argparse
+import sqlite3
+import pandas as pd
+import numpy as np
+import os
+import json
+import logging
+import matplotlib.pyplot as plt
+from datetime import datetime
+from collections import defaultdict
+
+# Sklearn и XGBoost
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from xgboost import XGBClassifier
+
+# TensorFlow
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Dropout, Embedding, Flatten, Concatenate
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Настройка логов
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    filename=f'logs/run_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+
+class VehicleRecommender:
+    def __init__(self, db_path="bbus.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.user_encoder = LabelEncoder()
+        self.item_encoder = LabelEncoder()
+        self.feature_scaler = StandardScaler()
+        self.model = None
+        self.xgb_model = None
+        self.user_embedding_size = 16
+        self.item_embedding_size = 16
+        self.history_size = 5
+        self.user_history = {}
+        self.feature_columns = []
+
+    def load_and_preprocess_data(self):
+        logging.info("Загрузка и предварительная обработка данных")
+        bookings = pd.read_sql_query("SELECT * FROM bookings ORDER BY date DESC", self.conn)
+        vehicles = pd.read_sql_query("SELECT * FROM vehicles", self.conn)
+        clients = pd.read_sql_query("SELECT * FROM clients", self.conn)
+
+        if bookings.empty or vehicles.empty or clients.empty:
+            logging.error("Одна из таблиц пуста. Прерывание загрузки.")
+            raise ValueError("Недостаточно данных для запуска системы")
+
+        data = pd.merge(bookings, vehicles, on='vehicle_id')
+        data = pd.merge(data, clients, on='client_id')
+
+        # Кодировка
+        data['client_id'] = self.user_encoder.fit_transform(data['client_id'])
+        data['vehicle_id'] = self.item_encoder.fit_transform(data['vehicle_id'])
+
+        # Преобразование features
+        vehicle_features = pd.get_dummies(data[['type']], prefix='type')
+        feature_split = data['features'].str.get_dummies(sep=', ')
+        vehicle_features = pd.concat([vehicle_features, feature_split], axis=1)
+        self.feature_columns = list(vehicle_features.columns)
+
+        # Нормализация
+        num_features = data[['client_id', 'vehicle_id']]
+        norm_features = self.feature_scaler.fit_transform(num_features)
+
+        # История
+        user_history = self._prepare_user_sequences(data)
+        self.user_history = user_history
+
+        return data, vehicle_features, norm_features, user_history
+
+    def _prepare_user_sequences(self, data):
+        logging.info("Подготовка истории заказов пользователей")
+        history = defaultdict(list)
+        for _, row in data.iterrows():
+            history[row['client_id']].append(row['vehicle_id'])
+
+        for user in history:
+            if len(history[user]) > self.history_size:
+                history[user] = history[user][:self.history_size]
+            else:
+                history[user] += [0] * (self.history_size - len(history[user]))
+        return history
+
+    def build_keras_model(self, num_users, num_items, num_features):
+        logging.info("Построение нейросетевой модели")
+        user_input = Input(shape=(1,), name='user_input')
+        item_input = Input(shape=(1,), name='item_input')
+        history_input = Input(shape=(self.history_size,), name='history_input')
+        features_input = Input(shape=(num_features,), name='features_input')
+
+        user_emb = Flatten()(Embedding(num_users, self.user_embedding_size)(user_input))
+        item_emb = Flatten()(Embedding(num_items, self.item_embedding_size)(item_input))
+        hist_emb = Flatten()(Embedding(num_items, self.item_embedding_size)(history_input))
+
+        x = Concatenate()([user_emb, item_emb, hist_emb, features_input])
+        x = Dense(128, activation='relu')(x)
+        x = Dropout(0.3)(x)
+        x = Dense(64, activation='relu')(x)
+        x = Dropout(0.3)(x)
+        output = Dense(1, activation='sigmoid')(x)
+
+        model = Model(inputs=[user_input, item_input, history_input, features_input], outputs=output)
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+        self.model = model
+
+    def prepare_training_data(self, data, vehicle_features, user_history):
+        logging.info("Формирование тренировочных данных")
+        pos = data[['client_id', 'vehicle_id']].copy()
+        pos['target'] = 1
+
+        neg = []
+        all_vehicles = data['vehicle_id'].unique()
+        for client_id in data['client_id'].unique():
+            taken = set(data[data['client_id'] == client_id]['vehicle_id'])
+            untaken = list(set(all_vehicles) - taken)
+            n = len(taken)
+            if len(untaken) < n:
+                continue
+            sampled = np.random.choice(untaken, size=n, replace=False)
+            for vid in sampled:
+                neg.append([client_id, vid, 0])
+
+        neg = pd.DataFrame(neg, columns=['client_id', 'vehicle_id', 'target'])
+        all_data = pd.concat([pos, neg], ignore_index=True)
+
+        X = {
+            'user_input': all_data['client_id'].values,
+            'item_input': all_data['vehicle_id'].values,
+            'history_input': np.array([user_history[u] for u in all_data['client_id']]),
+            'features_input': vehicle_features.loc[all_data['vehicle_id']].values
+        }
+
+        y = all_data['target'].values
+        return train_test_split(X, y, test_size=0.2, random_state=42)
+
+    def train_keras_model(self, X_train, y_train, X_val, y_val):
+        logging.info("Обучение нейросети")
+        callback = EarlyStopping(monitor='val_loss', patience=5)
+        history = self.model.fit(X_train, y_train,
+                                 validation_data=(X_val, y_val),
+                                 epochs=50,
+                                 batch_size=64,
+                                 callbacks=[callback])
+        self._plot_training_history(history)
+
+    def _plot_training_history(self, history):
+        plt.figure(figsize=(10, 5))
+        plt.plot(history.history['loss'], label='Train Loss')
+        plt.plot(history.history['val_loss'], label='Val Loss')
+        plt.legend()
+        plt.title("График функции потерь")
+        plt.xlabel("Эпоха")
+        plt.ylabel("Loss")
+        plt.grid()
+        os.makedirs("plots", exist_ok=True)
+        plt.savefig("plots/loss_plot.png")
+        plt.close()
+
+    def train_xgboost_model(self, X_train, y_train, X_val, y_val):
+        logging.info("Обучение XGBoost модели")
+        X_comb = np.concatenate([
+            X_train['user_input'].reshape(-1, 1),
+            X_train['item_input'].reshape(-1, 1),
+            X_train['history_input'],
+            X_train['features_input']
+        ], axis=1)
+
+        self.xgb_model = XGBClassifier(use_label_encoder=False, eval_metric='logloss')
+        self.xgb_model.fit(X_comb, y_train)
+
+        X_test = np.concatenate([
+            X_val['user_input'].reshape(-1, 1),
+            X_val['item_input'].reshape(-1, 1),
+            X_val['history_input'],
+            X_val['features_input']
+        ], axis=1)
+        preds = self.xgb_model.predict(X_test)
+        logging.info(classification_report(y_val, preds))
+
+    def recommend_for_user(self, client_id, top_n=5):
+        logging.info(f"Генерация рекомендаций для клиента {client_id}")
+        vehicles = pd.read_sql_query("SELECT * FROM vehicles", self.conn)
+        vehicles['encoded_id'] = self.item_encoder.transform(vehicles['vehicle_id'])
+
+        encoded_client_id = self.user_encoder.transform([client_id])[0]
+        user_hist = np.array([self.user_history.get(encoded_client_id, [0]*self.history_size)])
+
+        feat = pd.get_dummies(vehicles[['type']], prefix='type')
+        feat_split = vehicles['features'].str.get_dummies(sep=', ')
+        feat = pd.concat([feat, feat_split], axis=1)
+
+        for col in self.feature_columns:
+            if col not in feat.columns:
+                feat[col] = 0
+        feat = feat[self.feature_columns]
+
+        X = {
+            'user_input': np.full(len(vehicles), encoded_client_id),
+            'item_input': vehicles['encoded_id'].values,
+            'history_input': np.repeat(user_hist, len(vehicles), axis=0),
+            'features_input': feat.values
+        }
+
+        preds = self.model.predict(X).flatten()
+        top_idx = preds.argsort()[-top_n:][::-1]
+        top_recs = vehicles.iloc[top_idx]
+        top_recs['score'] = preds[top_idx]
+
+        filename = f"recommendations/client_{client_id}_{datetime.now().strftime('%H%M%S')}.csv"
+        os.makedirs("recommendations", exist_ok=True)
+        top_recs.to_csv(filename, index=False)
+        logging.info(f"Рекомендации сохранены в {filename}")
+
+        return top_recs[['vehicle_id', 'name', 'type', 'features', 'score']]
+
+
+# CLI обработка
+def main():
+    parser = argparse.ArgumentParser(description="Vehicle Recommendation System")
+    parser.add_argument("--mode", type=str, required=True, choices=["train", "recommend"])
+    parser.add_argument("--client", type=int, help="Client ID for recommendation")
+
+    args = parser.parse_args()
+    recommender = VehicleRecommender()
+    data, vfeat, nfeat, uhist = recommender.load_and_preprocess_data()
+
+    num_users = len(data['client_id'].unique())
+    num_items = len(data['vehicle_id'].unique())
+    num_features = vfeat.shape[1]
+    recommender.build_keras_model(num_users, num_items, num_features)
+
+    if args.mode == "train":
+        X_train, X_val, y_train, y_val = recommender.prepare_training_data(data, vfeat, uhist)
+        recommender.train_keras_model(X_train, y_train, X_val, y_val)
+        recommender.train_xgboost_model(X_train, y_train, X_val, y_val)
+    elif args.mode == "recommend":
+        if args.client is None:
+            print("Укажите --client для получения рекомендаций")
+        else:
+            print(recommender.recommend_for_user(args.client))
+
+
+if __name__ == "__main__":
+    main()
